@@ -11,8 +11,9 @@ reports. It only changes how the already-downloaded messages are presented.
 
 ## Install
 
-1. Download `ShowBlockedMessages.plugin.js` from this repository and copy it
-   to your BetterDiscord plugins folder.
+1. Download `ShowBlockedMessages.plugin.js` from the latest
+   [release](https://github.com/Fxkee/ShowBlockedMessages/releases/latest)
+   and copy it to your BetterDiscord plugins folder.
    On Windows that is `%APPDATA%\BetterDiscord\plugins`.
 2. Enable **ShowBlockedMessages** in Discord under User Settings → Plugins.
 
