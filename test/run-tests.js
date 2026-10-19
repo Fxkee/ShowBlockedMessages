@@ -430,6 +430,106 @@ test("start also installs the reply-preview patch and stop removes both", () => 
 });
 
 /* ---------------------------------------------------------------- */
+/* Jump guard                                                        */
+/* ---------------------------------------------------------------- */
+
+function fakeStore(blockedIds, ignoredIds = []) {
+    return {
+        isBlockedForMessage: message => blockedIds.includes(message.author?.id),
+        isIgnoredForMessage: message => ignoredIds.includes(message.author?.id)
+    };
+}
+
+test("onJumpGuard allows blocked authors without calling Discord's guard", () => {
+    const plugin = makePlugin();
+    plugin.relationshipStore = fakeStore(["blocked"]);
+    let originalCalls = 0;
+    const original = () => { originalCalls++; return false; };
+    assert.equal(plugin.onJumpGuard([{author: {id: "blocked"}}, () => {}], original), true);
+    assert.equal(originalCalls, 0);
+});
+
+test("onJumpGuard defers to Discord's guard for everyone else and returns its result", () => {
+    const plugin = makePlugin();
+    plugin.relationshipStore = fakeStore(["blocked"], ["ignored"]);
+    const seen = [];
+    const original = (...args) => { seen.push(args); return "original-result"; };
+    const message = {author: {id: "someone"}};
+    const confirm = () => {};
+    assert.equal(plugin.onJumpGuard([message, confirm], original), "original-result");
+    assert.deepEqual(seen, [[message, confirm]]);
+
+    assert.equal(plugin.onJumpGuard([{author: {id: "ignored"}}], original), "original-result", "ignored stays guarded by default");
+    plugin.updateSetting("revealIgnored", true);
+    assert.equal(plugin.onJumpGuard([{author: {id: "ignored"}}], original), true);
+});
+
+test("onJumpGuard is inert when inactive, without a store, or with bad input", () => {
+    const plugin = makePlugin();
+    const original = () => "orig";
+    assert.equal(plugin.onJumpGuard([{author: {id: "x"}}], original), "orig", "no store resolved");
+    plugin.relationshipStore = fakeStore(["x"]);
+    assert.equal(plugin.onJumpGuard(null, original), "orig");
+    assert.equal(plugin.onJumpGuard([null], original), "orig");
+    plugin.active = false;
+    assert.equal(plugin.onJumpGuard([{author: {id: "x"}}], original), "orig");
+});
+
+test("isRevealedAuthor survives a throwing store and reports once", () => {
+    const plugin = makePlugin();
+    plugin.relationshipStore = {isBlockedForMessage: () => { throw new Error("nope"); }, isIgnoredForMessage: () => false};
+    assert.equal(plugin.isRevealedAuthor({author: {id: "x"}}), false);
+    assert.equal(plugin.isRevealedAuthor({author: {id: "x"}}), false);
+    const reports = logs.filter(entry => entry[0] === "error" && String(entry[2]).includes("relationship store failed"));
+    assert.equal(reports.length, 1);
+});
+
+test("findFunctionExportKey finds the guard function and ignores non-functions", () => {
+    const guard = function d(e, t) { return e.isBlockedForMessage ? false : t.confirmText; };
+    assert.equal(Plugin.findFunctionExportKey({A: guard}, ["isBlockedForMessage", "confirmText"]), "A");
+    assert.equal(Plugin.findFunctionExportKey({A: guard}, ["somethingElse"]), null);
+    assert.equal(Plugin.findFunctionExportKey({A: 1, B: "x"}, ["x"]), null);
+});
+
+test("start installs the jump-guard patch when the module and store exist", () => {
+    const plugin = new Plugin({name: "ShowBlockedMessages"});
+    const inner = function ChatMessages(e) { return {channelStream: e, messageGroupSpacing: 1, showNewMessagesBar: true}; };
+    const chatExports = {A: {$$typeof: Symbol.for("react.memo"), type: inner, compare: null}};
+    const guardExports = {A: function d(e, t) { return e.isBlockedForMessage ? false : t.confirmText; }};
+    const sources = new Map([
+        [chatExports, "channelStream:messageGroupSpacing showNewMessagesBar"],
+        [guardExports, "isBlockedForMessage isIgnoredForMessage MODERATE_MEMBERS confirmText"]
+    ]);
+    const store = fakeStore(["blocked"]);
+
+    BdApi.Webpack.Filters.bySource = (...markers) => (exports) => markers.every(marker => (sources.get(exports) ?? "").includes(marker));
+    BdApi.Webpack.getStore = name => (name === "RelationshipStore" ? store : undefined);
+    BdApi.Webpack.getModule = (filter, options) => {
+        if (!options || options.defaultExport !== false) return undefined;
+        for (const exports of sources.keys()) if (filter(exports, {exports}, 1)) return exports;
+        return undefined;
+    };
+    const patches = [];
+    BdApi.Patcher.after = (caller, module, key, callback) => { patches.push({kind: "after", module, key, callback}); return () => {}; };
+    BdApi.Patcher.before = (caller, module, key, callback) => { patches.push({kind: "before", module, key, callback}); return () => {}; };
+    BdApi.Patcher.instead = (caller, module, key, callback) => { patches.push({kind: "instead", module, key, callback}); return () => {}; };
+    BdApi.Patcher.unpatchAll = () => {};
+
+    plugin.start();
+    assert.equal(plugin.jumpGuardModule, guardExports);
+    assert.equal(plugin.jumpGuardExportKey, "A");
+    assert.equal(plugin.relationshipStore, store);
+    const instead = patches.find(p => p.kind === "instead");
+    assert.ok(instead && instead.module === guardExports && instead.key === "A");
+    assert.equal(instead.callback(null, [{author: {id: "blocked"}}, () => {}], () => false), true);
+    assert.equal(instead.callback(null, [{author: {id: "other"}}, () => {}], () => "discord"), "discord");
+
+    plugin.stop();
+    assert.equal(plugin.jumpGuardModule, null);
+    assert.equal(plugin.relationshipStore, null);
+});
+
+/* ---------------------------------------------------------------- */
 
 (async () => {
     let failed = 0;

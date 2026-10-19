@@ -2,7 +2,7 @@
  * @name ShowBlockedMessages
  * @author Fxkee
  * @description Shows messages from users you have blocked as ordinary chat messages instead of the collapsed "blocked messages" row. The users stay blocked; only the chat presentation changes.
- * @version 1.1.0
+ * @version 1.2.0
  * @source https://github.com/Fxkee/ShowBlockedMessages
  * @updateUrl https://raw.githubusercontent.com/Fxkee/ShowBlockedMessages/main/ShowBlockedMessages.plugin.js
  */
@@ -32,9 +32,15 @@
  * plugin clears that prop before the component renders, so the preview shows
  * the referenced message's avatar and text like any other reply.
  *
- * Nothing about relationships is touched: no RelationshipStore patching, no
- * unblock actions, no message-record mutation. Removing the plugin restores
- * the native collapsed rows and placeholders.
+ * Clicking a reply preview (or a search result) runs a shared "can jump to
+ * this message" guard that shows a "you blocked this person" modal and
+ * refuses. The plugin answers that guard with "allowed" for blocked authors
+ * and defers to Discord for everyone else, so the spammer dialogs stay.
+ *
+ * Nothing about relationships is touched: the relationship store is only
+ * read, never patched, no unblock action is called and no message record is
+ * mutated. Removing the plugin restores the native rows, placeholders and
+ * modal.
  */
 
 const REACT_MEMO_TYPE = Symbol.for("react.memo");
@@ -66,6 +72,13 @@ const CHAT_MODULE_MARKERS = ["channelStream:", "messageGroupSpacing", "showNewMe
  */
 const REPLY_MODULE_MARKERS = ["isReplyAuthorBlocked", "contentPlaceholder", "isReplySpineClickable", "repliedAuthor"];
 const REPLY_COMPONENT_MARKERS = ["isReplyAuthorBlocked", "referencedMessage"];
+
+/**
+ * Source fragments of the module exporting the "can jump to this message"
+ * guard (blocked / ignored / spammer modals), and of the function itself.
+ */
+const JUMP_GUARD_MODULE_MARKERS = ["isBlockedForMessage", "isIgnoredForMessage", "MODERATE_MEMBERS", "confirmText"];
+const JUMP_GUARD_FUNCTION_MARKERS = ["isBlockedForMessage", "confirmText"];
 
 /** DOM entry points used to find chat views that are already on screen. */
 const MOUNTED_CHAT_SELECTOR = '[data-list-id="chat-messages"], li[id^="chat-messages-"]';
@@ -103,10 +116,16 @@ module.exports = class ShowBlockedMessages {
         this.replyModule = null;
         this.replyExportKey = null;
 
+        /** Webpack exports object that owns the jump guard, its key, and the store it is answered from. */
+        this.jumpGuardModule = null;
+        this.jumpGuardExportKey = null;
+        this.relationshipStore = null;
+
         /** channelStream array -> flattened array. Keyed by identity, so Discord's memoised streams hit the cache. */
         this.streamCache = new WeakMap();
         this.abortController = null;
         this.replyAbortController = null;
+        this.jumpAbortController = null;
         this.active = false;
         this.reportedProblems = new Set();
     }
@@ -141,7 +160,7 @@ module.exports = class ShowBlockedMessages {
     stop() {
         this.active = false;
 
-        for (const key of ["abortController", "replyAbortController"]) {
+        for (const key of ["abortController", "replyAbortController", "jumpAbortController"]) {
             if (this[key]) {
                 this[key].abort();
                 this[key] = null;
@@ -164,6 +183,9 @@ module.exports = class ShowBlockedMessages {
         this.chatComponent = null;
         this.replyModule = null;
         this.replyExportKey = null;
+        this.jumpGuardModule = null;
+        this.jumpGuardExportKey = null;
+        this.relationshipStore = null;
         this.streamCache = new WeakMap();
     }
 
@@ -401,6 +423,68 @@ module.exports = class ShowBlockedMessages {
         this.log("info", `Active. Blocked messages are shown as normal messages${refreshed ? ` (${refreshed} open chat view${refreshed === 1 ? "" : "s"} refreshed)` : ""}.`);
 
         this.installReplyPreviewPatch();
+        this.installJumpGuardPatch();
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Optional secondary patches                                          */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Resolves a module now or when it loads and hands its exports to
+     * `onFound`. Failures are logged as warnings: these patches are optional
+     * and the main feature keeps working without them.
+     */
+    resolveOptionalModule({label, filter, abortKey, onFound}) {
+        let exports = null;
+        try {
+            exports = BdApi.Webpack.getModule(filter, {defaultExport: false});
+        } catch (error) {
+            this.log("warn", `Searching for ${label} threw an error; that part stays on Discord's behaviour.`, error);
+            return;
+        }
+        if (exports) {
+            onFound(exports);
+            return;
+        }
+
+        const wait = BdApi.Webpack.waitForModule;
+        if (typeof wait !== "function") return;
+        const controller = typeof AbortController === "function" ? new AbortController() : null;
+        this[abortKey] = controller;
+        let promise;
+        try {
+            const options = {defaultExport: false};
+            if (controller) options.signal = controller.signal;
+            promise = wait(filter, options);
+        } catch (error) {
+            this.log("warn", `Waiting for ${label} threw an error.`, error);
+            return;
+        }
+        if (!promise || typeof promise.then !== "function") return;
+        promise.then(result => {
+            this[abortKey] = null;
+            if (this.active && result) onFound(result);
+        }).catch(error => {
+            this[abortKey] = null;
+            if (this.active) this.log("warn", `Waiting for ${label} failed.`, error);
+        });
+    }
+
+    /** Module filter: source markers on the module factory plus a plain-function export with its own markers. */
+    buildFunctionModuleFilter(moduleMarkers, functionMarkers) {
+        const Filters = BdApi.Webpack.Filters;
+        const bySource = typeof Filters?.bySource === "function" ? Filters.bySource(...moduleMarkers) : null;
+        return (exports, module, id) => {
+            if (bySource !== null) {
+                try {
+                    if (!bySource(exports, module, id)) return false;
+                } catch {
+                    return false;
+                }
+            }
+            return ShowBlockedMessages.findFunctionExportKey(exports, functionMarkers) !== null;
+        };
     }
 
     /* ------------------------------------------------------------------ */
@@ -415,59 +499,21 @@ module.exports = class ShowBlockedMessages {
      */
     installReplyPreviewPatch() {
         if (!this.active || this.replyModule) return;
-
-        let exports = null;
-        try {
-            exports = BdApi.Webpack.getModule(this.buildReplyModuleFilter(), {defaultExport: false});
-        } catch (error) {
-            this.log("warn", "Searching for the reply-preview component threw an error; reply previews keep Discord's placeholder.", error);
-            return;
-        }
-
-        if (exports) {
-            this.patchReplyPreview(exports);
-            return;
-        }
-
-        const wait = BdApi.Webpack.waitForModule;
-        if (typeof wait !== "function") return;
-        this.replyAbortController = typeof AbortController === "function" ? new AbortController() : null;
-        let promise;
-        try {
-            const options = {defaultExport: false};
-            if (this.replyAbortController) options.signal = this.replyAbortController.signal;
-            promise = wait(this.buildReplyModuleFilter(), options);
-        } catch (error) {
-            this.log("warn", "Waiting for the reply-preview component threw an error.", error);
-            return;
-        }
-        if (!promise || typeof promise.then !== "function") return;
-        promise.then(result => {
-            this.replyAbortController = null;
-            if (this.active && result) this.patchReplyPreview(result);
-        }).catch(error => {
-            this.replyAbortController = null;
-            if (this.active) this.log("warn", "Waiting for the reply-preview component failed.", error);
+        this.resolveOptionalModule({
+            label: "the reply-preview component",
+            filter: this.buildFunctionModuleFilter(REPLY_MODULE_MARKERS, REPLY_COMPONENT_MARKERS),
+            abortKey: "replyAbortController",
+            onFound: exports => this.patchReplyPreview(exports)
         });
-    }
-
-    buildReplyModuleFilter() {
-        const Filters = BdApi.Webpack.Filters;
-        const bySource = typeof Filters?.bySource === "function" ? Filters.bySource(...REPLY_MODULE_MARKERS) : null;
-        return (exports, module, id) => {
-            if (bySource !== null) {
-                try {
-                    if (!bySource(exports, module, id)) return false;
-                } catch {
-                    return false;
-                }
-            }
-            return ShowBlockedMessages.findReplyExportKey(exports) !== null;
-        };
     }
 
     /** Returns the key of the plain function export whose source mentions the reply-preview props, or null. */
     static findReplyExportKey(exports) {
+        return ShowBlockedMessages.findFunctionExportKey(exports, REPLY_COMPONENT_MARKERS);
+    }
+
+    /** Returns the key of a plain (non-class) function export whose source contains every marker, or null. */
+    static findFunctionExportKey(exports, markers) {
         if (exports === null || (typeof exports !== "object" && typeof exports !== "function")) return null;
         let keys;
         try {
@@ -491,7 +537,7 @@ module.exports = class ShowBlockedMessages {
             } catch {
                 continue;
             }
-            if (REPLY_COMPONENT_MARKERS.every(marker => source.includes(marker))) return key;
+            if (markers.every(marker => source.includes(marker))) return key;
         }
         return null;
     }
@@ -565,6 +611,90 @@ module.exports = class ShowBlockedMessages {
             this.reportOnce("refresh-replies", "Re-rendering open reply previews failed; they update when their message re-renders.", error);
         }
         return refreshed;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Jumping to a blocked user's message                                 */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Discord runs a shared guard before jumping to a referenced message
+     * (reply click, search result). It shows a "you blocked this person"
+     * modal and returns false for blocked authors. The patch answers "allowed"
+     * for authors this plugin reveals and lets Discord handle everyone else.
+     */
+    installJumpGuardPatch() {
+        if (!this.active || this.jumpGuardModule) return;
+        this.resolveOptionalModule({
+            label: "the jump-to-message guard",
+            filter: this.buildFunctionModuleFilter(JUMP_GUARD_MODULE_MARKERS, JUMP_GUARD_FUNCTION_MARKERS),
+            abortKey: "jumpAbortController",
+            onFound: exports => this.patchJumpGuard(exports)
+        });
+    }
+
+    /** Finds Discord's relationship store, which is only ever read. */
+    resolveRelationshipStore() {
+        const {Webpack} = BdApi;
+        const candidates = [];
+        try {
+            if (typeof Webpack.getStore === "function") candidates.push(Webpack.getStore("RelationshipStore"));
+        } catch {
+            // fall through to the key-based lookup
+        }
+        try {
+            candidates.push(Webpack.getModule(Webpack.Filters.byKeys("isBlockedForMessage", "isIgnoredForMessage", "isBlocked")));
+        } catch {
+            // handled below
+        }
+        return candidates.find(store => store && typeof store.isBlockedForMessage === "function" && typeof store.isIgnoredForMessage === "function") ?? null;
+    }
+
+    patchJumpGuard(exports) {
+        if (!this.active || this.jumpGuardModule) return;
+        const key = ShowBlockedMessages.findFunctionExportKey(exports, JUMP_GUARD_FUNCTION_MARKERS);
+        if (key === null) {
+            this.log("warn", "The jump-guard module was found but has an unexpected shape; jumping to blocked users' messages keeps Discord's modal.");
+            return;
+        }
+
+        const store = this.resolveRelationshipStore();
+        if (!store) {
+            this.log("warn", "Discord's relationship store could not be found; jumping to blocked users' messages keeps Discord's modal.");
+            return;
+        }
+
+        let unpatch = null;
+        try {
+            unpatch = BdApi.Patcher.instead(this.name, exports, key, (_thisObject, args, original) => this.onJumpGuard(args, original));
+        } catch (error) {
+            this.log("warn", "Patching the jump guard failed; jumping to blocked users' messages keeps Discord's modal.", error);
+            return;
+        }
+        if (typeof unpatch !== "function") return;
+
+        this.jumpGuardModule = exports;
+        this.jumpGuardExportKey = key;
+        this.relationshipStore = store;
+    }
+
+    /** `instead` callback for the jump guard: allow revealed authors, defer to Discord for everyone else. */
+    onJumpGuard(args, original) {
+        const message = Array.isArray(args) ? args[0] : undefined;
+        if (this.active && this.isRevealedAuthor(message)) return true;
+        return original(...(Array.isArray(args) ? args : []));
+    }
+
+    /** True when this plugin shows the message's author normally (blocked, or ignored with the setting on). */
+    isRevealedAuthor(message) {
+        if (message === null || typeof message !== "object" || !this.relationshipStore) return false;
+        try {
+            if (this.relationshipStore.isBlockedForMessage(message)) return true;
+            return this.settings.revealIgnored && this.relationshipStore.isIgnoredForMessage(message) === true;
+        } catch (error) {
+            this.reportOnce("relationship-read", "Reading the relationship store failed; Discord's own jump guard is used.", error);
+            return false;
+        }
     }
 
     static isReplyPreviewFiber(fiber) {

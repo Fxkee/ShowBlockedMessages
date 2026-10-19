@@ -47,6 +47,13 @@ shows a "Blocked message" placeholder when it is set. A second, optional
 avatar and text. If that component cannot be found, the main feature still
 works and only the previews keep Discord's placeholder.
 
+Clicking a reply preview or a search result runs a shared "can jump to this
+message" guard that shows a "Soo... you blocked this person" modal and
+refuses. A third optional patch answers that guard with "allowed" when the
+author is blocked (read from the relationship store, which is never written)
+and defers to Discord's own guard for everyone else, so the spammer dialogs
+are unchanged.
+
 Because a `React.memo` component caches its inner function on mounted fibers,
 patching alone would only affect chats opened later. For chats already on
 screen, the plugin points their fibers at the patched function and triggers
